@@ -1,0 +1,1021 @@
+#include "secret.h"
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <Adafruit_INA219.h>
+#include <DHT.h>
+#include <Preferences.h>
+#include <driver/uart.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
+
+// ================= PINS =================
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define modem_rst 18
+#define post_led 2
+
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_INA219 ina219;
+
+// SIM UART
+HardwareSerial simSerial(1);
+
+// ================= AWS =================
+#define AWS_IOT_PUBLISH_TOPIC "dht/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "dht/sub"
+
+WebServer server(80);
+TaskHandle_t webTaskHandle = NULL;
+bool webServerRunning = false;  // ← Only ONE declaration
+
+TaskHandle_t awsTaskHandle = NULL;
+
+SemaphoreHandle_t simMutex;
+TaskHandle_t gpsTaskHandle;
+
+// ================= GLOBAL =================
+int post_interval = 20000;
+int gnss_error_count = 0;
+float h = 0, t = 0;
+float busVoltage = 0, current_mA = 0, power_mW = 0;
+float ckwh = 0.0;
+double latitude = 0, longitude = 0;
+int network;
+//int gnss_error = 0;
+String hmiBuffer = "";
+String ip = "";
+String gnss = "";
+String nextionData = "";
+String post_int;
+unsigned long update_loop = 0;
+
+String wifi_ssid = "";
+String wifi_pass = "";
+String sim_apn = "";
+
+// ================= CKWh Persistent =================
+unsigned long lastEnergyCalc = 0;
+unsigned long lastCKWhSave = 0;
+unsigned long lastPub = 0;        // For AWS/SIM upload
+unsigned long lastHMIrecord = 0;  // ← NEW: For HMI data record (always runs)
+
+int gnss_done = 1;
+int iv_done = 1;
+
+Preferences prefs;
+
+WiFiClientSecure net;
+PubSubClient client(net);
+
+unsigned long lastAWSAttempt = 0;
+
+// ================= FUNCTION PROTOTYPES =================
+// ================= FUNCTION PROTOTYPES =================
+bool connectAWS();
+String getTimeStamp();
+void updateNetworkStatus();
+void updateWiFiIP();
+bool isSIMConnected();
+void readSIMGPS();
+void sendDataSIM(String json);
+void publishMessage();
+//void logToCSV();
+void sendCommand(String cmd);
+void appendToCSVFromHMI(String rawLine);
+
+// ================= CSV LOGGING =================
+
+
+void appendToCSVFromHMI(String rawLine) {
+  if (!SPIFFS.begin(true)) return;
+
+  File file = SPIFFS.open("/log.csv", FILE_APPEND);
+  if (!file) return;
+
+  if (file.size() == 0) {
+    file.println("Date,Time,Temperature,Humidity,Voltage,Current,Power,CKWh,Latitude,Longitude");
+  }
+
+  // Replace ^ with , to convert to proper CSV
+  rawLine.replace("^", ",");
+  file.println(rawLine);
+  file.close();
+}
+
+
+//==========================================================================
+void TaskAWS(void *pvParameters) {
+  Serial.println("☁️ AWS Task Started on Core " + String(xPortGetCoreID()));
+
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!client.connected()) {
+        if (millis() - lastAWSAttempt > 8000) {
+          lastAWSAttempt = millis();
+          connectAWS();  // Safe here
+        }
+      } else {
+        client.loop();  // Keep connection alive
+      }
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+//==========================================================================
+void TaskWebServer(void *pvParameters) {
+  Serial.println("🌐 WebServer Task Started on Core " + String(xPortGetCoreID()));
+
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!webServerRunning) {
+        server.begin();
+        webServerRunning = true;
+        Serial.println("✅ Web Server Started → http://" + WiFi.localIP().toString());
+      }
+      server.handleClient();  // Must be called as fast as possible
+    } else {
+      if (webServerRunning) {
+        server.stop();
+        webServerRunning = false;
+        Serial.println("⛔ Web Server Stopped (No WiFi)");
+      }
+    }
+
+    vTaskDelay(5 / portTICK_PERIOD_MS);  // Very small delay = responsive
+  }
+}
+
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE HTML>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SOLAR MONITORING SYSTEM</title>
+  <meta http-equiv="refresh" content="5">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  <style>
+    :root {
+      --bg: #0f0f1a;
+      --card: #1a1a2e;
+      --accent: #00ff9d;
+      --text: #e0e0ff;
+    }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: linear-gradient(135deg, #0f0f1a 0%, #16213e 100%);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container { max-width: 1100px; margin: auto; }
+    h1 {
+      font-size: 2.8rem;
+      background: linear-gradient(90deg, #00ff9d, #00b8ff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      text-align: center;
+      margin-bottom: 10px;
+    }
+    .btn {
+      display: inline-block;
+      padding: 12px 24px;
+      background: #00ff9d;
+      color: #000;
+      font-weight: bold;
+      border-radius: 50px;
+      text-decoration: none;
+      margin: 15px;
+      transition: 0.3s;
+    }
+    .btn:hover {
+      background: #00cc7a;
+      transform: scale(1.05);
+    }
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 20px;
+      margin-top: 20px;
+    }
+    .card {
+      background: var(--card);
+      border-radius: 20px;
+      padding: 22px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+      transition: all 0.3s;
+    }
+    .card:hover { transform: translateY(-8px); }
+    .value { font-size: 2.3rem; font-weight: 700; color: var(--accent); }
+    .label { color: #a0a0cc; text-transform: uppercase; font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1><i class="fas fa-microchip"></i> SOLAR MONITORING SYSTEM</h1>
+    <p style="text-align:center; margin-bottom:20px;">Real-Time Sensor Dashboard</p>
+
+    <div style="text-align:center;">
+      <a href="/download" class="btn"><i class="fas fa-download"></i> Download Log CSV</a>
+    </div>
+
+    <div class="time" style="text-align:center; margin:20px 0; font-size:1.1rem;">
+      🕒 %TIME%
+    </div>
+
+    <div class="card-grid">
+      <!-- Your existing cards here (Temperature, Humidity, etc.) -->
+      <div class="card"><i class="fas fa-thermometer-half" style="color:#ff6b6b;"></i><div class="label">Temperature</div><div class="value">%TEMP% °C</div></div>
+      <div class="card"><i class="fas fa-tint" style="color:#00b8ff;"></i><div class="label">Humidity</div><div class="value">%HUM% %</div></div>
+      <div class="card"><i class="fas fa-bolt" style="color:#ffd93d;"></i><div class="label">Voltage</div><div class="value">%VOLTAGE% V</div></div>
+      <div class="card"><i class="fas fa-current" style="color:#a55eea;"></i><div class="label">Current</div><div class="value">%CURRENT% mA</div></div>
+      <div class="card"><i class="fas fa-plug" style="color:#00ff9d;"></i><div class="label">Power</div><div class="value">%POWER% mW</div></div>
+      <div class="card"><i class="fas fa-battery-full" style="color:#feca57;"></i><div class="label">Energy</div><div class="value">%CKWH% kWh</div></div>
+      <div class="card"><i class="fas fa-map-marker-alt"></i><div class="label">Latitude</div><div class="value">%LAT%</div></div>
+      <div class="card"><i class="fas fa-map-marker-alt"></i><div class="label">Longitude</div><div class="value">%LON%</div></div>
+      <div class="card"><i class="fas fa-satellite"></i><div class="label">GNSS</div><div class="value" style="color:%GNSS_COLOR%">%GNSS%</div></div>
+    </div>
+
+    <div style="text-align:center; margin-top:30px; color:#8899ff;">
+      Network: <strong>%NETWORK%</strong> • IP: <strong>%IP%</strong>
+    </div>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+  // Replace placeholders (same as before)
+  html.replace("%TEMP%", String(t, 2));
+  html.replace("%HUM%", String(h, 1));
+  html.replace("%VOLTAGE%", String(busVoltage, 2));
+  html.replace("%CURRENT%", String(current_mA, 3));
+  html.replace("%POWER%", String(power_mW, 1));
+  html.replace("%CKWH%", String(ckwh, 4));
+  html.replace("%LAT%", String(latitude, 6));
+  html.replace("%LON%", String(longitude, 6));
+  html.replace("%TIME%", getTimeStamp());
+  html.replace("%GNSS%", gnss);
+  html.replace("%IP%", ip);
+
+  String netStr = (network == 1) ? "WiFi" : (network == 2 ? "SIM" : "Offline");
+  html.replace("%NETWORK%", netStr);
+
+  String gnssColor = (gnss == "LOCKED") ? "#00ff9d" : "#ffd93d";
+  html.replace("%GNSS_COLOR%", gnssColor);
+
+  server.send(200, "text/html", html);
+}
+// ================= NETWORK STATUS =================
+void updateNetworkStatus() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 3000) return;
+  lastCheck = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    network = 1;
+    return;
+  }
+  if (isSIMConnected()) network = 2;
+  else network = 3;
+}
+//==========================================================================
+void calculateEnergy() {
+  unsigned long now = millis();
+  if (lastEnergyCalc == 0) {
+    lastEnergyCalc = now;
+    return;
+  }
+
+  float deltaSeconds = (now - lastEnergyCalc) / 1000.0;
+  float power_kW = power_mW / 1000000.0;
+  ckwh += power_kW * (deltaSeconds / 3600.0);
+  lastEnergyCalc = now;
+}
+// ================= NVS =================
+void loadCredentials() {
+  prefs.begin("credentials", false);
+  wifi_ssid = prefs.getString("ssid", "");
+  wifi_pass = prefs.getString("pass", "");
+  sim_apn = prefs.getString("apn", "");
+  ckwh = prefs.getFloat("ckwh", 0.0);
+  post_int = prefs.getString("post_int", "");
+  prefs.end();
+
+  post_interval = (post_int.toInt() * 1000);
+
+  Serial.println("📂 Loaded from NVS:");
+  Serial.printf("SSID : %s\n", wifi_ssid.c_str());
+  Serial.printf("PASS : %s\n", wifi_pass.length() > 0 ? "********" : "NOT SET");
+  Serial.printf("APN  : %s\n", sim_apn.c_str());
+  Serial.printf("CKWh : %.4f kWh\n", ckwh);
+  Serial.printf("POST INTERVAL  : %s\n", post_int.c_str());
+}
+//============================================================================
+void saveCKWh() {
+  if (millis() - lastCKWhSave < 300000) return;
+  prefs.begin("credentials", false);
+  prefs.putFloat("ckwh", ckwh);
+  prefs.end();
+  lastCKWhSave = millis();
+  Serial.printf("💾 CKWh saved: %.4f kWh\n", ckwh);
+}
+// ================= HMI =================
+void processHMICommand() {
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    hmiBuffer += c;
+    if (hmiBuffer.length() > 128) hmiBuffer = "";
+  }
+
+  if (hmiBuffer.length() > 0) {
+    Serial.print("📥 HMI Command Received: ");
+    Serial.println(hmiBuffer);
+
+    if (hmiBuffer.indexOf("esp_reset") != -1) {
+      digitalWrite(modem_rst, HIGH);
+      delay(2000);
+      digitalWrite(modem_rst, LOW);
+      ESP.restart();
+    }
+
+    else if (hmiBuffer.indexOf("cleare_ckwh") != -1) {
+      ckwh = 0.0;
+      lastEnergyCalc = millis();
+      saveCKWh();
+      Serial.println("🗑️ CKWh Reset to 0 and saved");
+    } else if (hmiBuffer.indexOf("ssid_") != -1) {
+      wifi_ssid = hmiBuffer.substring(5);
+      wifi_ssid.trim();
+      prefs.begin("credentials", false);
+      prefs.putString("ssid", wifi_ssid);
+      prefs.end();
+    } else if (hmiBuffer.indexOf("password_") != -1) {
+      wifi_pass = hmiBuffer.substring(9);
+      wifi_pass.trim();
+      prefs.begin("credentials", false);
+      prefs.putString("pass", wifi_pass);
+      prefs.end();
+    } else if (hmiBuffer.indexOf("apn_") != -1) {
+      sim_apn = hmiBuffer.substring(4);
+      sim_apn.trim();
+      prefs.begin("credentials", false);
+      prefs.putString("apn", sim_apn);
+      prefs.end();
+    } else if (hmiBuffer.indexOf("post_interval_") != -1) {
+      post_int = hmiBuffer.substring(14);
+      sim_apn.trim();
+      prefs.begin("credentials", false);
+      prefs.putString("post_int", post_int);
+      prefs.end();
+      post_interval = (post_int.toInt() * 1000);
+    }  //int post_interval = 20000;
+    //>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>..
+    // ====================== SYNC COMMAND ======================
+    else if (hmiBuffer.indexOf("sync_started") != -1) {
+      Serial.println("🔄 [SYNC] Large Logging Started from HMI - Clearing old data...");
+
+      // === DELETE OLD FILE ===
+      if (SPIFFS.exists("/log.csv")) {
+        if (SPIFFS.remove("/log.csv")) {
+          Serial.println("🗑️ Old log.csv deleted successfully");
+        } else {
+          Serial.println("⚠️ Failed to delete old log.csv");
+        }
+      }
+
+      // === START NEW FILE ===
+      if (!SPIFFS.begin(true)) {
+        Serial.println("❌ SPIFFS Mount Failed during sync");
+        hmiBuffer = "";
+        return;
+      }
+
+      File file = SPIFFS.open("/log.csv", FILE_WRITE);  // FILE_WRITE creates new file
+      if (!file) {
+        Serial.println("❌ Failed to create new log.csv");
+        hmiBuffer = "";
+        return;
+      }
+
+      // Write header
+      file.println("Date,Time,Temperature,Humidity,Voltage,Current,Power,CKWh,Latitude,Longitude");
+      file.close();
+
+      Serial.println("✅ New log.csv created. Receiving data...");
+
+      // === RECEIVE DATA FROM HMI ===
+      String log_data;
+      unsigned long syncTimeout = millis();
+
+      while (true) {
+        if (millis() - syncTimeout > 60000) {  // 60 second safety timeout
+          Serial.println("⏰ Sync timeout!");
+          break;
+        }
+
+        if (Serial2.available()) {
+          log_data = Serial2.readStringUntil('$');
+          log_data.trim();
+
+          if (log_data.indexOf("end_log") != -1) {
+            Serial.println("✅ Received end_log signal - Sync Finished");
+            break;
+          }
+
+          if (log_data.length() > 10) {  // Avoid empty/invalid lines
+            appendToCSVFromHMI(log_data);
+            Serial.println("✓ Appended: " + log_data.substring(0, 60) + "...");
+          }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+      }
+
+      Serial.println("🎉 SYNC Completed Successfully");
+    }
+
+    //>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+    hmiBuffer = "";
+  }
+}
+
+// ================= TIME =================
+String getTimeStamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "0";
+  char buf[30];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+String sendAT(String command, uint32_t timeout = 2500) {
+  String temp = "";
+  if (xSemaphoreTake(simMutex, pdMS_TO_TICKS(10000))) {
+    while (simSerial.available()) simSerial.read();
+    simSerial.println(command);
+    Serial.print(">> ");
+    Serial.println(command);
+
+    uint32_t start = millis();
+    while (millis() - start < timeout) {
+      while (simSerial.available()) {
+        char c = simSerial.read();
+        if (c == '\r' || c == '\n' || (c >= 32 && c <= 126)) temp += c;
+      }
+      vTaskDelay(10);
+    }
+    xSemaphoreGive(simMutex);
+  }
+  return temp;
+}
+
+void sendCommand(String cmd) {
+  Serial2.print(cmd);
+  Serial2.write(0xFF);
+  Serial2.write(0xFF);
+  Serial2.write(0xFF);
+  delay(10);
+}
+
+void updateWiFiIP() {
+  ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "No WiFi";
+}
+
+bool waitForNextion(String expected, unsigned long timeout = 8000) {
+  unsigned long startTime = millis();
+  nextionData = "";
+  Serial.println("Waiting for: " + expected);
+  while (millis() - startTime < timeout) {
+    while (Serial2.available()) {
+      char c = Serial2.read();
+      nextionData += c;
+      if (nextionData.indexOf(expected) != -1) {
+        Serial.println("✓ Received: " + expected);
+        return true;
+      }
+      if (nextionData.length() > 100) nextionData = "";
+    }
+    delay(10);
+  }
+  Serial.println("✗ Timeout");
+  return false;
+}
+
+bool connectWiFi(unsigned long timeoutMs = 15000) {
+  if (wifi_ssid.length() == 0) return false;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+  Serial.printf("🔗 Connecting to WiFi: %s\n", wifi_ssid.c_str());
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi Connected");
+    updateWiFiIP();
+    return true;
+  }
+  Serial.println("\n❌ WiFi Failed");
+  return false;
+}
+
+bool connectAWS() {
+  Serial.println("🔄 Connecting to AWS IoT...");
+
+  net.setCACert(AWS_CERT_CA);
+  net.setCertificate(AWS_CERT_CRT);
+  net.setPrivateKey(AWS_CERT_PRIVATE);
+  client.setServer(AWS_IOT_ENDPOINT, 8883);
+  client.setKeepAlive(60);  // Helps stability
+
+  if (client.connect(THINGNAME)) {
+    client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+    Serial.println("✅ AWS IoT Connected");
+    return true;
+  }
+  Serial.printf("❌ AWS Failed (state: %d)\n", client.state());
+  return false;
+}
+void simInit() {
+  Serial.println("🔄 Starting SIM7672 Initialization...");
+
+  // Basic modem setup
+  simSerial.println("AT");
+  delay(1000);
+  simSerial.println("ATE0");
+  delay(500);
+  simSerial.println("AT+CMEE=2");
+  delay(500);
+  simSerial.println("AT+CREG=1");
+  delay(1000);
+  simSerial.println("AT+CGREG=1");
+  delay(1000);
+  simSerial.println("AT+CEREG=1");
+  delay(1000);
+  simSerial.println("AT+CGATT=1");
+  delay(2000);
+
+  // APN
+  simSerial.print("AT+CGDCONT=1,\"IP\",\"");
+  simSerial.print(sim_apn);
+  simSerial.println("\"");
+  delay(1500);
+  simSerial.println("AT+CGACT=1,1");
+  delay(3000);
+
+  // ================= GNSS INITIALIZATION =================
+  Serial.println("🔄 Initializing GNSS...");
+
+  sendAT("AT+CGNSSPWR=0", 3000);  // Turn OFF first
+  delay(2000);
+
+  Serial.println("🔌 Turning GNSS ON...");
+  sendAT("AT+CGNSSPWR=1", 20000);  // Long timeout
+
+  // Check status multiple times
+  bool gnssReady = false;
+  for (int i = 0; i < 15; i++) {
+    String status = sendAT("AT+CGNSSPWR?", 2000);
+    Serial.println("GNSS Status: [" + status + "]");
+
+    if (status.indexOf("1") != -1 || status.indexOf("READY") != -1) {  // Accept 0,0,1 or READY
+      gnssReady = true;
+      Serial.println("✅ GNSS Powered ON");
+      break;
+    }
+    delay(1500);
+  }
+
+  if (!gnssReady) {
+    Serial.println("⚠️ GNSS Power ON may have failed");
+  }
+
+  sendAT("AT+CGNSSMODE=1", 1500);  // GPS + GLONASS + BeiDou
+  sendAT("AT+CGNSSPORTSWITCH=1,1", 1500);
+  sendAT("AT+CGNSSNMEARATE=1", 1500);
+
+  // Optional: Cold start on first boot
+  // sendAT("AT+CGPSCOLD", 5000);
+
+  Serial.println("✅ SIM & GNSS Init Completed");
+}
+
+
+bool isSIMConnected() {
+  static unsigned long lastSimCheck = 0;
+  static bool lastState = false;
+  static uint8_t failCount = 0;
+
+  if (millis() - lastSimCheck < 15000) return lastState;  // <--- Increase to 15s
+  lastSimCheck = millis();
+
+  String resp1 = sendAT("AT+CREG?", 1500);
+  String resp2 = sendAT("AT+CGACT?", 1500);
+
+  bool registered = (resp1.indexOf(",1") != -1 || resp1.indexOf(",5") != -1);
+  bool attached = (resp2.indexOf("+CGACT: 1,1") != -1);
+
+  bool currentState = registered && attached;
+  if (currentState) {
+    failCount = 0;
+    lastState = true;
+  } else {
+    failCount++;
+    if (failCount >= 5) lastState = false;  // More tolerance
+  }
+  return lastState;
+}
+void readSIMGPS() {
+  static unsigned long lastGNSSAttempt = 0;
+  static int errorCount = 0;
+
+  if (millis() - lastGNSSAttempt < 6000) return;
+  lastGNSSAttempt = millis();
+
+  Serial.println("\n📡 ============== GNSS QUERY ==============");
+
+  while (simSerial.available()) simSerial.read();  // Flush buffer
+
+  String resp = sendAT("AT+CGNSSINFO", 10000);  // Long timeout
+
+  Serial.println("📥 RAW: [" + resp + "]");
+
+  resp.replace("\r", "");
+  resp.replace("\n", "");
+  resp.trim();
+
+  if (resp.indexOf("ERROR") != -1) {
+    Serial.println("❌ GNSS Command ERROR");
+    gnss = "ERROR";
+    errorCount++;
+
+    if (errorCount >= 5) {
+      Serial.println("🔄 Restarting GNSS engine...");
+      sendAT("AT+CGNSSPWR=0", 3000);
+      delay(2000);
+      sendAT("AT+CGNSSPWR=1", 15000);
+      errorCount = 0;
+    }
+    return;
+  }
+
+  errorCount = 0;
+
+  // No fix yet
+  if (resp.indexOf("+CGNSSINFO: 0") != -1 || resp.indexOf(",,,,,") != -1 || resp.length() < 40) {
+
+    gnss = "SEARCH";
+    Serial.println("🌍 GNSS Searching... (No satellite fix yet)");
+    return;
+  }
+
+  // Parse data
+  int idx = resp.indexOf("+CGNSSINFO:");
+  if (idx == -1) {
+    gnss = "FORMAT_ERROR";
+    Serial.println("⚠️ Format error");
+    return;
+  }
+
+  String data = resp.substring(idx + 12);
+  data.trim();
+
+  String fields[15];
+  int count = 0, startPos = 0;
+  for (int i = 0; i < data.length() && count < 15; i++) {
+    if (data[i] == ',') {
+      fields[count++] = data.substring(startPos, i);
+      startPos = i + 1;
+    }
+  }
+  if (startPos < data.length()) fields[count++] = data.substring(startPos);
+
+  if (count < 8) {
+    gnss = "INCOMPLETE";
+    return;
+  }
+
+  String latStr = fields[5];
+  String latDir = fields[6];
+  String lonStr = fields[7];
+  String lonDir = fields[8];
+
+  latitude = latStr.toDouble();
+  longitude = lonStr.toDouble();
+
+  if (latDir == "S" || latDir == "s") latitude = -latitude;
+  if (lonDir == "W" || lonDir == "w") longitude = -longitude;
+
+  gnss = "LOCKED";
+  Serial.printf("✅ GNSS LOCKED → Lat: %.7f  Lon: %.7f\n", latitude, longitude);
+}
+
+
+void sendDataSIM(String json) {
+  sendAT("AT+HTTPTERM", 1000);
+  if (sendAT("AT+HTTPINIT", 3000).indexOf("OK") == -1) return;
+  sendAT("AT+HTTPPARA=\"CID\",1", 1000);
+  sendAT("AT+HTTPPARA=\"URL\",\"http://testurl.online/aws_proxy/api.php\"", 2000);
+  //sendAT("AT+HTTPPARA=\"URL\",\"http://testurl.online/aws_proxy/api_ckwh.php\"", 2000);
+  sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 1000);
+
+  String cmd = "AT+HTTPDATA=" + String(json.length()) + ",10000";
+  if (sendAT(cmd, 3000).indexOf("DOWNLOAD") == -1) return;
+
+  simSerial.print(json);
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  sendAT("AT+HTTPACTION=1", 12000);
+  sendAT("AT+HTTPREAD", 3000);
+  sendAT("AT+HTTPTERM", 1000);
+}
+
+void publishMessage() {
+  StaticJsonDocument<256> doc;
+  doc["temperature"] = t;
+  doc["humidity"] = h;
+  doc["voltage"] = busVoltage;
+  doc["current"] = current_mA;
+  doc["power"] = power_mW;
+  //doc["ckwh"] = ckwh;           // ← I recommend enabling this
+  doc["lat"] = latitude;
+  doc["lon"] = longitude;
+  doc["time"] = getTimeStamp();
+  doc["gnss"] = gnss;
+
+  char buf[512];
+  serializeJson(doc, buf);
+
+  if (WiFi.status() == WL_CONNECTED && client.connected()) {
+    client.publish(AWS_IOT_PUBLISH_TOPIC, buf);
+    iv_done = 1;
+    Serial.println("📤 Published to AWS");
+  } else if (isSIMConnected()) {
+    while (gnss_done == 0) {
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+    iv_done = 0;
+    //vTaskSuspend(gpsTaskHandle);
+    sendDataSIM(String(buf));
+    //vTaskResume(gpsTaskHandle);
+    iv_done = 1;
+  }
+  //modem_redy = 1;
+}
+
+
+// ================= TASKS =================
+void TaskSensors(void *pv) {
+  while (1) {
+    float h_new = dht.readHumidity();
+    float t_new = dht.readTemperature();
+    if (!isnan(h_new) && !isnan(t_new)) {
+      h = h_new;
+      t = t_new;
+    }
+
+    busVoltage = (ina219.getBusVoltage_V() + 0.7);
+    current_mA = ina219.getCurrent_mA();
+    if (current_mA < 0) current_mA = 0;
+    power_mW = ina219.getPower_mW();
+
+    calculateEnergy();
+    saveCKWh();
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
+  }
+}
+
+void TaskGPS(void *pv) {
+  while (1) {
+    while (iv_done == 0) {
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+    gnss_done = 0;
+    readSIMGPS();
+    gnss_done = 1;
+    led_marker();
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    //modem_redy=0;
+  }
+}
+
+void TaskPrint(void *pv) {
+  while (1) {
+    Serial.println("===== DATA =====");
+    Serial.printf("Temperature : %.2f °C | Humidity : %.2f %%\n", t, h);
+    Serial.printf("Voltage     : %.2f V\n", busVoltage);
+    Serial.printf("Current     : %.6f mA\n", current_mA);
+    Serial.printf("Power       : %.2f mW\n", power_mW);
+    Serial.printf("CKWh        : %.6f kWh\n", ckwh);
+    Serial.printf("Latitude    : %.7f °\n", latitude);
+    Serial.printf("Longitude   : %.7f °\n", longitude);
+    Serial.println("================\n");
+    vTaskDelay(4000 / portTICK_PERIOD_MS);
+  }
+}
+
+// ================= FIXED taskHMI =================
+void taskHMI(void *pvParameters) {
+  Serial.println("Task HMI started");
+
+  bool ready = waitForNextion("system_ready", 10000);
+  if (ready) {
+    Serial.println("Nextion is READY!");
+    sendCommand("t0.txt=\"System Ready\"");
+  }
+
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  sendCommand("page page1");
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  sendCommand("page page1");
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  sendCommand("page page1");
+
+  while (true) {                                                   // Must never exit
+    if (millis() - update_loop >= (network == 3 ? 8000 : 2000)) {  // slower when offline
+      updateWiFiIP();
+      updateNetworkStatus();
+
+      sendCommand("page1.t7.txt=\"" + String(ckwh, 6) + "\"");
+      sendCommand("page1.t4.txt=\"" + String(busVoltage, 2) + "\"");
+      sendCommand("page1.t5.txt=\"" + String(current_mA, 2) + "\"");
+      sendCommand("page1.t6.txt=\"" + String(power_mW, 0) + "\"");
+      sendCommand("page1.t9.txt=\"" + String(t, 1) + "\"");
+      sendCommand("page1.t8.txt=\"" + String(h, 0) + "\"");
+      sendCommand("page1.t2.txt=\"" + String(longitude, 6) + "\"");
+      sendCommand("page1.t3.txt=\"" + String(latitude, 6) + "\"");
+      sendCommand("page1.t1.txt=\"" + ip + "\"");
+      sendCommand("page1.va7.val=" + String(network));
+      sendCommand("page1.t10.txt=\"" + gnss + "\"");
+
+
+      update_loop = millis();
+    }
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+}
+
+void addDataRecord() {
+  String cmd = String(t, 2) + "^" + String(h, 2) + "^" + String(busVoltage, 2) + "^" + String(current_mA, 3) + "^" + String(power_mW, 1) + "^" + String(ckwh, 4) + "^" + String(latitude, 6) + "^" + String(longitude, 6);
+
+  sendCommand("page9.tva0.txt=\"" + cmd + "\"");
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  sendCommand("page9.va0.txt=\"update\"");
+  Serial.println("📊 Row added: " + cmd);
+}
+
+void TaskHMIcommand(void *pv) {
+  while (1) {
+    processHMICommand();
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+}
+void led_marker(){
+  digitalWrite(post_led, HIGH);
+  delay(250);
+  digitalWrite(post_led, LOW);
+  delay(250);
+  digitalWrite(post_led, HIGH);
+  delay(250);
+  digitalWrite(post_led, LOW);
+  delay(250);
+  digitalWrite(post_led, HIGH);
+  delay(250);
+  digitalWrite(post_led, LOW);
+  delay(250);
+  digitalWrite(post_led, HIGH);
+  delay(250);
+  digitalWrite(post_led, LOW);
+}
+
+// ================= SETUP =================
+void setup() {
+  pinMode(modem_rst, OUTPUT);
+  pinMode(post_led, OUTPUT);
+  digitalWrite(modem_rst, HIGH);
+  delay(2000);
+  digitalWrite(modem_rst, LOW);
+  Serial.begin(9600);
+  delay(2000);
+
+  loadCredentials();
+
+  Serial2.begin(9600, SERIAL_8N1, 16, 17);
+  uart_set_loop_back(UART_NUM_2, false);
+
+  simSerial.setRxBufferSize(2048);
+  simSerial.begin(9600, SERIAL_8N1, 32, 33);
+  simMutex = xSemaphoreCreateMutex();
+
+  simInit();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      Serial.println("✅ WiFi Connected - Got IP");
+      updateWiFiIP();
+    }
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      Serial.println("❌ WiFi Disconnected");
+    }
+  });
+
+  if (connectWiFi()) {
+    Serial.println("🌐 WiFi Available at boot");
+  } else {
+    Serial.println("📶 Will use SIM");
+  }
+
+  configTime(19800, 0, "pool.ntp.org");
+
+  dht.begin();
+  Wire.begin(21, 22);
+  ina219.begin();
+  ina219.setCalibration_32V_1A();
+
+  xTaskCreatePinnedToCore(TaskSensors, "SENS", 5120, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskGPS, "GPS", 6144, NULL, 1, &gpsTaskHandle, 0);  //modem_redy = 1;
+  xTaskCreatePinnedToCore(TaskPrint, "PRINT", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskHMI, "taskHMI", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskHMIcommand, "HMIcmd", 8192, NULL, 1, NULL, 1);
+
+  // ================= WEB SERVER ROUTES =================
+  server.on("/", handleRoot);  // ← THIS WAS MISSING!
+
+  server.on("/data", HTTP_GET, []() {  // Bonus: JSON API
+    StaticJsonDocument<512> doc;
+    doc["temperature"] = t;
+    doc["humidity"] = h;
+    doc["voltage"] = busVoltage;
+    doc["current"] = current_mA;
+    doc["power"] = power_mW;
+    doc["ckwh"] = ckwh;
+    doc["lat"] = latitude;
+    doc["lon"] = longitude;
+    doc["time"] = getTimeStamp();
+    doc["gnss"] = gnss;
+    doc["network"] = (network == 1) ? "WiFi" : (network == 2 ? "SIM" : "Offline");
+
+    String json;
+    serializeJson(doc, json);
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/download", HTTP_GET, []() {
+    if (SPIFFS.exists("/log.csv")) {
+      File file = SPIFFS.open("/log.csv", "r");
+      server.streamFile(file, "text/csv");
+      file.close();
+    } else {
+      server.send(404, "text/plain", "No log file found yet.");
+    }
+  });
+
+  server.onNotFound([]() {
+    server.send(404, "text/html", "<h1>404 - Not Found</h1><p><a href='/'>← Back to Dashboard</a></p>");
+  });
+
+  Serial.println("🌐 Web routes registered");
+
+  // === Start Tasks ===
+  xTaskCreatePinnedToCore(TaskWebServer, "WebSrv", 8192, NULL, 1, &webTaskHandle, 0);
+  xTaskCreatePinnedToCore(TaskAWS, "AWS", 8192, NULL, 2, &awsTaskHandle, 1);
+
+  Serial.println("🚀 System Ready");
+}
+
+// ================= LOOP =================
+void loop() {
+  static unsigned long lastWiFiRetry = 0;
+
+  if (millis() - lastWiFiRetry > 10000) {
+    lastWiFiRetry = millis();
+    if (WiFi.status() != WL_CONNECTED && wifi_ssid.length() > 0) {
+      WiFi.reconnect();
+    }
+  }
+
+  if (millis() - lastPub > post_interval) {
+    publishMessage();
+    digitalWrite(post_led, HIGH);
+    delay(100);
+    digitalWrite(post_led, LOW);
+    lastPub = millis();
+  }
+
+  if (millis() - lastHMIrecord > post_interval) {
+    addDataRecord();
+    lastHMIrecord = millis();
+  }
+
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+}
