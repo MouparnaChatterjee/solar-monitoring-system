@@ -1,0 +1,34 @@
+##------------------- library inclusion------------------------------------#
+import json 
+import boto3
+from decimal import Decimal
+#----------------------connecting table of the database------------#
+dynamodb = boto3.resource('dynamodb')
+TABLE_NAME = 'SolarData'
+
+## get objects from the table
+def get_table():
+    return dynamodb.Table(TABLE_NAME)
+
+##------------record collection -----------------------------------------#
+def fetch_records(limit=20, last_key=None):
+    table = get_table()
+
+    params = {
+        'Limit': limit
+    }
+
+    if last_key:
+        params['ExclusiveStartKey'] = last_key
+
+    response = table.scan(**params)
+
+    return response
+
+
+def format_response(data, last_key=None):
+    return {
+        "count": len(data),
+        "lastKey": last_key,
+        "records": data
+    }
